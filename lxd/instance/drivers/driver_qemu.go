@@ -1583,7 +1583,10 @@ func (d *qemu) start(stateful bool, op *operationlock.InstanceOperation) error {
 
 	// Attempt to drop privileges (doesn't work when restoring state).
 	if !stateful && d.state.OS.UnprivUser != "" {
-		qemuVer, _ := d.version()
+		qemuVer, err := d.version()
+		if err != nil {
+			d.logger.Warn("Failed to detect QEMU version", logger.Ctx{"err": err})
+		}
 		qemuVer91, _ := version.NewDottedVersion("9.1.0")
 
 		// Since QEMU 9.1 the parameter `runas` has been marked as deprecated.
@@ -9280,7 +9283,25 @@ func (d *qemu) checkFeatures(hostArch int, qemuPath string) (map[string]any, err
 func (d *qemu) version() (*version.DottedVersion, error) {
 	qemuVer := DriverStatuses()[instancetype.VM].Version
 	if qemuVer == nil {
-		return nil, errors.New("QEMU version unavailable")
+		// DriverStatuses() parses Info.Version directly, which can include extra
+		// tokens (e.g. "(external)") when using an external QEMU snap.
+		// Fall back to parsing just the leading version token.
+		qemuVersionStr := DriverStatuses()[instancetype.VM].Info.Version
+		if qemuVersionStr == "" {
+			return nil, errors.New("QEMU version unavailable")
+		}
+
+		qemuVersionParts := strings.Fields(qemuVersionStr)
+		if len(qemuVersionParts) < 1 {
+			return nil, errors.New("QEMU version unavailable")
+		}
+
+		parsedVer, err := version.NewDottedVersion(qemuVersionParts[0])
+		if err != nil {
+			return nil, errors.New("QEMU version unavailable")
+		}
+
+		return parsedVer, nil
 	}
 
 	return qemuVer, nil
