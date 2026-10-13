@@ -83,6 +83,31 @@ Or pass all AMD GPUs from the host:
 
 For a complete example on how to use a GPU CDI pass-through, see {ref}`container-gpu-passthrough-with-docker`.
 
+(gpu-physical-grace-coherent)=
+#### NVIDIA Grace coherent-memory GPUs (VMs only)
+
+The `physical` GPU device automatically detects NVIDIA Grace coherent-memory GPUs
+(GH200/GB200 family) in ARM64 VMs. On the host, LXD binds them to
+`nvgrace_gpu_vfio_pci` instead of `vfio-pci`. In the VM, it generates a dedicated
+`iommufd`-backed VFIO device, a `pxb-pcie`/`arm-smmuv3` PCI expander bridge, eight
+bare NUMA nodes and eight matching ACPI generic initiator objects.
+No extra device options are required, for example:
+
+    lxc config device add <instance_name> <device_name> gpu gputype=physical pci=<pci_address>
+
+The host kernel must provide `nvgrace_gpu_vfio_pci` and `/dev/iommu`.
+QEMU must support accelerated `arm-smmuv3` with the `accel`, `ats`, `ril` and `oas`
+properties. The QEMU version bundled with this snap does not provide these
+properties; use a compatible external QEMU.
+
+Up to eight coherent-memory GPUs are supported per VM. LXD sets the
+`highmem-mmio-size` machine property to 4 TiB for up to four GPUs and 8 TiB for
+five to eight GPUs. To override it, use
+{config:option}`instance-raw:raw.qemu.conf`:
+
+    [machine]
+    highmem-mmio-size = "8T"
+
 (gpu-mdev)=
 ## `gputype`: `mdev`
 

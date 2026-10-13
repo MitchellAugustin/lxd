@@ -263,6 +263,7 @@ func (d *gpuPhysical) startVM() (*deviceConfig.RunConfig, error) {
 
 	saveData := make(map[string]string)
 	var pciAddress string
+	coherentMemory := false
 
 	for _, gpu := range gpus.Cards {
 		// Skip any cards that are not selected.
@@ -297,16 +298,23 @@ func (d *gpuPhysical) startVM() (*deviceConfig.RunConfig, error) {
 		}
 
 		pciAddress = gpu.PCIAddress
+		coherentMemory = isGraceCoherentGPU(gpu.VendorID, gpu.ProductID)
 	}
 
 	if pciAddress == "" {
 		return nil, errors.New("Failed detecting requested GPU device")
 	}
 
-	// Make sure that vfio-pci is loaded.
-	err = util.LoadModule("vfio-pci")
+	// Grace GPUs need the variant driver to expose their coherent memory as System RAM.
+	vfioDriver := "vfio-pci"
+	if coherentMemory {
+		vfioDriver = "nvgrace_gpu_vfio_pci"
+	}
+
+	// Make sure the required vfio driver is loaded.
+	err = util.LoadModule(vfioDriver)
 	if err != nil {
-		return nil, fmt.Errorf("Error loading %q module: %w", "vfio-pci", err)
+		return nil, fmt.Errorf("Error loading %q module: %w", vfioDriver, err)
 	}
 
 	// Get PCI information about the GPU device.
@@ -318,16 +326,21 @@ func (d *gpuPhysical) startVM() (*deviceConfig.RunConfig, error) {
 	saveData["last_state.pci.slot.name"] = pciDev.SlotName
 	saveData["last_state.pci.driver"] = pciDev.Driver
 
-	err = d.pciDeviceDriverOverrideIOMMU(pciDev, "vfio-pci", false)
+	err = d.pciDeviceDriverOverrideIOMMU(pciDev, vfioDriver, false)
 	if err != nil {
 		return nil, fmt.Errorf("Failed overriding IOMMU group driver: %w", err)
 	}
 
-	runConf.GPUDevice = append(runConf.GPUDevice,
-		[]deviceConfig.RunConfigItem{
-			{Key: "devName", Value: d.name},
-			{Key: "pciSlotName", Value: saveData["last_state.pci.slot.name"]},
-		}...)
+	gpuDevItems := []deviceConfig.RunConfigItem{
+		{Key: "devName", Value: d.name},
+		{Key: "pciSlotName", Value: saveData["last_state.pci.slot.name"]},
+	}
+
+	if coherentMemory {
+		gpuDevItems = append(gpuDevItems, deviceConfig.RunConfigItem{Key: "coherentMemory", Value: "true"})
+	}
+
+	runConf.GPUDevice = append(runConf.GPUDevice, gpuDevItems...)
 
 	err = d.volatileSet(saveData)
 	if err != nil {
@@ -457,14 +470,14 @@ func (d *gpuPhysical) postStop() error {
 		return nil
 	}
 
-	// If VM physical pass through, unbind from vfio-pci and bind back to host driver.
+	// If VM physical pass through, unbind from the current driver and bind back to the host driver.
 	if d.inst.Type() == instancetype.VM && v["last_state.pci.slot.name"] != "" {
-		pciDev := pcidev.Device{
-			Driver:   "vfio-pci",
-			SlotName: v["last_state.pci.slot.name"],
+		pciDev, err := pcidev.ParseUeventFile(filepath.Join("/sys/bus/pci/devices", v["last_state.pci.slot.name"], "uevent"))
+		if err != nil {
+			return fmt.Errorf("Failed getting PCI device info for GPU %q: %w", v["last_state.pci.slot.name"], err)
 		}
 
-		err := d.pciDeviceDriverOverrideIOMMU(pciDev, v["last_state.pci.driver"], true)
+		err = d.pciDeviceDriverOverrideIOMMU(pciDev, v["last_state.pci.driver"], true)
 		if err != nil {
 			return err
 		}

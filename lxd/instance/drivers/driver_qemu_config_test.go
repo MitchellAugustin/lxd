@@ -1,12 +1,15 @@
 package drivers
 
 import (
+	"fmt"
 	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 
+	deviceConfig "github.com/canonical/lxd/lxd/device/config"
 	"github.com/canonical/lxd/shared/osarch"
+	"github.com/canonical/lxd/shared/revert"
 )
 
 // BenchmarkQemuStringifyCfg benchmarks the hot path of qemuStringifyCfg, which is called on every VM start.
@@ -79,6 +82,19 @@ func TestQemuConfigTemplates(t *testing.T) {
 			accel = "kvm"
 			usb = "off"
 			memory-backend = "mach-virt.ram"
+
+			[boot-opts]
+			strict = "on"`,
+		}, {
+			qemuBaseOpts{architecture: osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN, coherentGPUCount: 2},
+			`# Machine
+			[machine]
+			graphics = "off"
+			type = "virt"
+			gic-version = "max"
+			accel = "kvm"
+			usb = "off"
+			highmem-mmio-size = "4T"
 
 			[boot-opts]
 			strict = "on"`,
@@ -1107,9 +1123,104 @@ func TestQemuConfigTemplates(t *testing.T) {
 			addr = "00.0"
 			multifunction = "on"
 			sysfsdev = "/sys/bus/mdev/devices/vgpu-dev"`,
+		}, {
+			qemuGPUDevPhysicalOpts{
+				dev:         qemuDevOpts{"pcie", "lxd_rp_gpu--name", "00.0", false},
+				devName:     "gpu-name",
+				pciSlotName: "gpu-slot",
+				iommufd:     "iommufd0",
+			},
+			`# GPU card ("gpu-name" device)
+			[device "dev-lxd_gpu--name"]
+			driver = "vfio-pci-nohotplug"
+			bus = "lxd_rp_gpu--name"
+			addr = "00.0"
+			host = "gpu-slot"
+			iommufd = "iommufd0"
+			rombar = "0"`,
 		}}
 		for _, tc := range testCases {
 			runTest(tc.expected, qemuGPUDevPhysical(&tc.opts))
+		}
+	})
+
+	t.Run("qemu_iommufd", func(t *testing.T) {
+		runTest(`[object "iommufd0"]
+			qom-type = "iommufd"`, qemuIOMMUFD(&qemuIOMMUFDOpts{id: "iommufd0"}))
+	})
+
+	t.Run("qemu_pci_expander_bridge", func(t *testing.T) {
+		opts := qemuPCIExpanderBridgeOpts{
+			bridgeName:      "lxd_pxb_gpu0",
+			busNr:           128,
+			devAddr:         "1f.0",
+			numaNode:        0,
+			smmuName:        "lxd_smmu_gpu0",
+			rootPortName:    "lxd_rp_gpu0",
+			rootPortChassis: 128,
+		}
+
+		runTest(`[device "lxd_pxb_gpu0"]
+			driver = "pxb-pcie"
+			bus = "pcie.0"
+			bus_nr = "128"
+			addr = "1f.0"
+			numa_node = "0"
+
+			[device "lxd_smmu_gpu0"]
+			driver = "arm-smmuv3"
+			primary-bus = "lxd_pxb_gpu0"
+			accel = "on"
+			ats = "on"
+			ril = "off"
+			oas = "48"
+
+			[device "lxd_rp_gpu0"]
+			driver = "pcie-root-port"
+			bus = "lxd_pxb_gpu0"
+			chassis = "128"
+			io-reserve = "0"
+			addr = "00.0"`, qemuPCIExpanderBridge(&opts))
+
+	})
+
+	t.Run("qemu_coherent_numa_node", func(t *testing.T) {
+		runTest(`[numa]
+			type = "node"
+			nodeid = "5"`, qemuCoherentNumaNode(5))
+	})
+
+	t.Run("qemu_acpi_generic_initiator", func(t *testing.T) {
+		opts := qemuACPIGenericInitiatorOpts{
+			objID:    "lxd_gi_gpu0_0",
+			pciDevID: "dev-lxd_gpu0",
+			nodeID:   5,
+		}
+
+		runTest(`[object "lxd_gi_gpu0_0"]
+			qom-type = "acpi-generic-initiator"
+			pci-dev = "dev-lxd_gpu0"
+			node = "5"`, qemuACPIGenericInitiator(&opts))
+	})
+
+	t.Run("qemu_highmem_mmio_size", func(t *testing.T) {
+		testCases := []struct {
+			count    int
+			expected string
+		}{
+			{0, ""},
+			{-1, ""},
+			{1, "4T"},
+			{4, "4T"},
+			{5, "8T"},
+			{8, "8T"},
+		}
+
+		for _, tc := range testCases {
+			actual := qemuHighmemMMIOSize(tc.count)
+			if actual != tc.expected {
+				t.Errorf("qemuHighmemMMIOSize(%d): expected %q, got %q", tc.count, tc.expected, actual)
+			}
 		}
 	})
 
@@ -1733,5 +1844,252 @@ func TestQemuCPU_NumaHostNodesPreservesOrder(t *testing.T) {
 	// The caller's slice must not be mutated.
 	if !reflect.DeepEqual(opts.cpuNumaHostNodes, []uint64{10, 8, 9}) {
 		t.Fatalf("Expected input slice to be unchanged, got: %v", opts.cpuNumaHostNodes)
+	}
+}
+
+// TestQemuCPU_CoherentGPUsDefineNumaNodeZero verifies that on ARM64 with coherent GPUs, NUMA
+// node 0 owns the guest RAM, as the GPU's pxb-pcie bridge is attached to it.
+func TestQemuCPU_CoherentGPUsDefineNumaNodeZero(t *testing.T) {
+	opts := qemuCPUOpts{
+		architecture: osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN,
+		coherentGPUs: true,
+		cpuCount:     1,
+		cpuMaxCPUs:   64,
+		memory:       1024,
+	}
+
+	config := qemuStringifyCfg(qemuCPU(&opts, false)...).String()
+
+	for _, want := range []string{`[object "mem0"]`, `nodeid = "0"`, `memdev = "mem0"`, `cpus = "0-63"`} {
+		if !strings.Contains(config, want) {
+			t.Fatalf("Expected %q in config, got: %s", want, config)
+		}
+	}
+}
+
+func TestQemuCPU_CoherentGPUsPinnedMemory(t *testing.T) {
+	for _, hugepages := range []string{"", "/hugepages"} {
+		t.Run(hugepages, func(t *testing.T) {
+			opts := qemuCPUOpts{
+				architecture:     osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN,
+				coherentGPUs:     true,
+				cpuCount:         2,
+				cpuSockets:       1,
+				cpuCores:         2,
+				cpuThreads:       1,
+				cpuNumaHostNodes: []uint64{8, 10},
+				cpuNumaMapping: []qemuNumaEntry{
+					{node: 0, socket: 0, core: 0, thread: 0},
+					{node: 1, socket: 0, core: 1, thread: 0},
+				},
+				memory:    8192,
+				hugepages: hugepages,
+			}
+
+			config := qemuCPU(&opts, true)
+			for _, section := range config {
+				if !strings.HasPrefix(section.name, `object "mem`) {
+					continue
+				}
+
+				if !strings.Contains(qemuStringifyCfg(section).String(), `share = "on"`) {
+					t.Fatalf("NUMA memory backend is not shared: %+v", section)
+				}
+			}
+
+			actual := qemuStringifyCfg(config...).String()
+			for _, want := range []string{`host-nodes.0 = "8"`, `host-nodes.0 = "10"`, `node-id = "0"`, `node-id = "1"`} {
+				if !strings.Contains(actual, want) {
+					t.Fatalf("Missing %q in config:\n%s", want, actual)
+				}
+			}
+		})
+	}
+}
+
+func TestQemuCoherentGPUConfig(t *testing.T) {
+	for _, count := range []int{1, 2, 4, 8} {
+		t.Run(fmt.Sprintf("%d GPUs", count), func(t *testing.T) {
+			d := &qemu{}
+			d.architecture = osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN
+			d.expandedConfig = map[string]string{"limits.memory": "16GiB"}
+			cpuInfo := &cpuTopology{cores: 4}
+			cfg := qemuBase(&qemuBaseOpts{architecture: d.architecture, coherentGPUCount: count})
+			nextNode, err := d.addCPUMemoryConfig(&cfg, cpuInfo, 64, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if nextNode != 1 {
+				t.Fatalf("Expected GPU NUMA nodes to start at 1, got %d", nextNode)
+			}
+
+			alloc := &coherentGPUAllocator{nextNode: nextNode}
+			busAllocate := func(string, bool) (revert.Hook, string, string, bool, error) {
+				t.Fatal("Coherent GPU must not use the ordinary bus allocator")
+				return nil, "", "", false, nil
+			}
+
+			for i := range count {
+				devName := fmt.Sprintf("gpu%d", i)
+				runConfig := []deviceConfig.RunConfigItem{
+					{Key: "devName", Value: devName},
+					{Key: "pciSlotName", Value: "not-a-pci-device"},
+					{Key: "coherentMemory", Value: "true"},
+				}
+
+				err = d.addGPUDevConfig(&cfg, "pcie", busAllocate, runConfig, alloc)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			names := map[string]bool{}
+			for _, section := range cfg {
+				if section.name == "numa" {
+					continue
+				}
+
+				if names[section.name] {
+					t.Fatalf("Duplicate section %q", section.name)
+				}
+
+				names[section.name] = true
+			}
+
+			config := qemuStringifyCfg(cfg...).String()
+			if strings.Count(config, `qom-type = "iommufd"`) != 1 ||
+				strings.Count(config, `qom-type = "acpi-generic-initiator"`) != count*8 ||
+				strings.Count(config, `driver = "vfio-pci-nohotplug"`) != count {
+				t.Fatalf("Incorrect GPU topology:\n%s", config)
+			}
+
+			for i := range count {
+				for _, want := range []string{
+					fmt.Sprintf(`bus_nr = "%d"`, 128+i*8),
+					fmt.Sprintf(`chassis = "%d"`, 128+i*8),
+					fmt.Sprintf(`addr = "%x.0"`, 31-i),
+					fmt.Sprintf(`pci-dev = "dev-lxd_gpu%d"`, i),
+				} {
+					if !strings.Contains(config, want) {
+						t.Fatalf("Missing %q in config:\n%s", want, config)
+					}
+				}
+			}
+
+			for node := range 1 + count*8 {
+				if strings.Count(config, fmt.Sprintf("nodeid = \"%d\"\n", node)) != 1 {
+					t.Fatalf("NUMA node %d is missing or duplicated:\n%s", node, config)
+				}
+			}
+		})
+	}
+}
+
+func TestQemuGPUConfigLegacy(t *testing.T) {
+	d := &qemu{}
+	d.architecture = osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN
+	cfg := []cfgSection{}
+	allocations := 0
+	busAllocate := func(string, bool) (revert.Hook, string, string, bool, error) {
+		allocations++
+		return nil, "qemu_pcie4", "00.0", false, nil
+	}
+
+	err := d.addGPUDevConfig(&cfg, "pcie", busAllocate, []deviceConfig.RunConfigItem{
+		{Key: "devName", Value: "gpu0"},
+		{Key: "pciSlotName", Value: "not-a-pci-device"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if allocations != 1 || len(cfg) != 1 || !strings.Contains(qemuStringifyCfg(cfg...).String(), `driver = "vfio-pci"`) {
+		t.Fatalf("Ordinary GPU configuration changed: %+v", cfg)
+	}
+}
+
+func TestQemuCoherentGPUConfigInvalid(t *testing.T) {
+	tests := []struct {
+		name         string
+		architecture int
+		bus          string
+		allocator    *coherentGPUAllocator
+	}{
+		{name: "non-ARM64", architecture: osarch.ARCH_64BIT_INTEL_X86, bus: "pcie", allocator: &coherentGPUAllocator{}},
+		{name: "non-PCIe", architecture: osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN, bus: "pci", allocator: &coherentGPUAllocator{}},
+		{name: "missing allocator", architecture: osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN, bus: "pcie"},
+		{name: "too many GPUs", architecture: osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN, bus: "pcie", allocator: &coherentGPUAllocator{count: 8}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &qemu{}
+			d.architecture = tt.architecture
+			cfg := []cfgSection{}
+			err := d.addGPUDevConfig(&cfg, tt.bus, nil, []deviceConfig.RunConfigItem{
+				{Key: "devName", Value: "gpu0"},
+				{Key: "coherentMemory", Value: "true"},
+			}, tt.allocator)
+			if err == nil || len(cfg) != 0 {
+				t.Fatalf("Expected failure without config changes, got %v, %+v", err, cfg)
+			}
+		})
+	}
+}
+
+func TestQemuCoherentGPUBusLimits(t *testing.T) {
+	tests := []struct {
+		name    string
+		gpus    int
+		ports   int
+		nextDev int
+		wantErr bool
+	}{
+		{name: "ordinary VM", ports: 128, nextDev: 32},
+		{name: "last free bus", gpus: 1, ports: 127, nextDev: 17},
+		{name: "bus overlap", gpus: 1, ports: 128, nextDev: 17, wantErr: true},
+		{name: "last free slot", gpus: 8, ports: 100, nextDev: 24},
+		{name: "slot overlap", gpus: 8, ports: 100, nextDev: 25, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			alloc := &coherentGPUAllocator{count: tt.gpus}
+			err := alloc.validateBus(&qemuBus{portNum: tt.ports, devNum: tt.nextDev})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Expected error: %t, got %v", tt.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestQemuCoherentGPUPinnedNUMA(t *testing.T) {
+	d := &qemu{}
+	d.architecture = osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN
+	d.expandedConfig = map[string]string{"limits.memory": "16GiB"}
+	cpuInfo := &cpuTopology{
+		sockets: 1,
+		cores:   2,
+		threads: 1,
+		vcpus:   []uint64{0, 1},
+		nodes:   map[uint64][]uint64{10: {1}, 8: {0}},
+	}
+
+	cfg := []cfgSection{}
+	nextNode, err := d.addCPUMemoryConfig(&cfg, cpuInfo, 2, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if nextNode != 2 {
+		t.Fatalf("Expected GPU NUMA nodes to follow the two CPU nodes, got %d", nextNode)
+	}
+
+	config := qemuStringifyCfg(cfg...).String()
+	if strings.Count(config, `size = "8192M"`) != 2 ||
+		strings.Count(config, `share = "on"`) != 2 ||
+		strings.Index(config, `host-nodes.0 = "8"`) >= strings.Index(config, `host-nodes.0 = "10"`) {
+		t.Fatalf("Incorrect pinned NUMA memory configuration:\n%s", config)
 	}
 }
