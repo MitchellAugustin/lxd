@@ -2072,7 +2072,7 @@ func TestQemuCoherentGPUPinnedNUMA(t *testing.T) {
 		sockets: 1,
 		cores:   2,
 		threads: 1,
-		vcpus:   []uint64{0, 1},
+		vcpus:   map[uint64]uint64{0: 0, 1: 1},
 		nodes:   map[uint64][]uint64{10: {1}, 8: {0}},
 	}
 
