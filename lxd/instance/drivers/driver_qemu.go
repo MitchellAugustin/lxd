@@ -3837,12 +3837,38 @@ func (d *qemu) deviceBootPriorities(base int) (map[string]int, error) {
 func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, maxCPUs int, mountInfo *storagePools.MountInfo, busName string, vsockFD int, devConfs []*deviceConfig.RunConfig, fdFiles *[]*os.File) (string, []monitorHook, error) {
 	var monHooks []monitorHook
 
-	cfg := qemuBase(&qemuBaseOpts{d.Architecture()})
+	// Count the coherent-memory GPUs up front as the machine and CPU/NUMA config depend on it.
+	coherentGPUCount := 0
+	for _, devConf := range devConfs {
+		for _, item := range devConf.GPUDevice {
+			if item.Key == "coherentMemory" && item.Value == "true" {
+				coherentGPUCount++
+			}
+		}
+	}
 
-	err := d.addCPUMemoryConfig(&cfg, cpuInfo, maxCPUs)
+	if coherentGPUCount > 0 {
+		if d.architecture != osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN || busName != "pcie" {
+			return "", nil, errors.New("Coherent-memory GPUs require an ARM64 VM with PCIe")
+		}
+
+		if coherentGPUCount > coherentGPUMaxCount {
+			return "", nil, fmt.Errorf("Coherent-memory GPU limit exceeded: maximum is %d", coherentGPUMaxCount)
+		}
+	}
+
+	cfg := qemuBase(&qemuBaseOpts{
+		architecture:     d.Architecture(),
+		coherentGPUCount: coherentGPUCount,
+	})
+
+	nextNumaNode, err := d.addCPUMemoryConfig(&cfg, cpuInfo, maxCPUs, coherentGPUCount > 0)
 	if err != nil {
 		return "", nil, err
 	}
+
+	// Allocates non-overlapping NUMA nodes and PCI bus numbers across the coherent-memory GPUs.
+	coherentGPUAlloc := &coherentGPUAllocator{nextNode: nextNumaNode}
 
 	// Parse raw.qemu.
 	rawOptions := []string{}
@@ -4249,7 +4275,7 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, maxCPUs int, mountIn
 
 		// Add GPU device.
 		if len(runConf.GPUDevice) > 0 {
-			err = d.addGPUDevConfig(&cfg, bus.name, busAllocate, runConf.GPUDevice)
+			err = d.addGPUDevConfig(&cfg, bus.name, busAllocate, runConf.GPUDevice, coherentGPUAlloc)
 			if err != nil {
 				return "", nil, err
 			}
@@ -4314,6 +4340,11 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, maxCPUs int, mountIn
 		d.logger.Debug("Allocating empty bus device", logger.Ctx{"bus": busName})
 	}
 
+	err = coherentGPUAlloc.validateBus(bus)
+	if err != nil {
+		return "", nil, err
+	}
+
 	// process any user-specified overrides
 	cfg = qemuRawCfgOverride(cfg, d.expandedConfig)
 	// Write the config file to disk.
@@ -4323,10 +4354,12 @@ func (d *qemu) generateQemuConfigFile(cpuInfo *cpuTopology, maxCPUs int, mountIn
 }
 
 // addCPUMemoryConfig adds the qemu config required for setting the number of virtualised CPUs and memory.
-// If sb is nil then no config is written.
-func (d *qemu) addCPUMemoryConfig(cfg *[]cfgSection, cpuInfo *cpuTopology, maxCPUs int) error {
+// If cfg is nil then no config is written.
+// Returns the first free NUMA node ID, after the CPU nodes (ACPI SRAT requires those first).
+func (d *qemu) addCPUMemoryConfig(cfg *[]cfgSection, cpuInfo *cpuTopology, maxCPUs int, coherentGPUs bool) (int, error) {
 	cpuOpts := qemuCPUOpts{
 		architecture:        d.architecture,
+		coherentGPUs:        coherentGPUs,
 		cpuMaxCPUs:          maxCPUs,
 		qemuMemObjectFormat: "indexed", // Supported by QEMU 6.0+
 	}
@@ -4413,14 +4446,14 @@ func (d *qemu) addCPUMemoryConfig(cfg *[]cfgSection, cpuInfo *cpuTopology, maxCP
 
 	memSizeBytes, err := parseMemoryStr(memSize)
 	if err != nil {
-		return fmt.Errorf("limits.memory invalid: %w", err)
+		return 0, fmt.Errorf("limits.memory invalid: %w", err)
 	}
 
 	cpuOpts.hugepages = ""
 	if shared.IsTrue(d.expandedConfig["limits.memory.hugepages"]) {
 		hugetlb, err := util.HugepagesPath()
 		if err != nil {
-			return err
+			return 0, err
 		}
 
 		cpuOpts.hugepages = hugetlb
@@ -4429,8 +4462,8 @@ func (d *qemu) addCPUMemoryConfig(cfg *[]cfgSection, cpuInfo *cpuTopology, maxCP
 	// Determine per-node memory limit.
 	memSizeMB := memSizeBytes / 1024 / 1024
 	nodeMemory := memSizeMB
-	if d.architecture == osarch.ARCH_64BIT_INTEL_X86 {
-		// On x86_64 the memory is split across one backend per NUMA node.
+	if d.architecture == osarch.ARCH_64BIT_INTEL_X86 || coherentGPUs {
+		// On x86_64 (and with coherent GPUs) the memory is split across one backend per NUMA node.
 		nodeMemory = memSizeMB / int64(len(hostNodes))
 	}
 
@@ -4441,7 +4474,7 @@ func (d *qemu) addCPUMemoryConfig(cfg *[]cfgSection, cpuInfo *cpuTopology, maxCP
 		*cfg = append(*cfg, qemuCPU(&cpuOpts, cpuPinning)...)
 	}
 
-	return nil
+	return len(hostNodes), nil
 }
 
 // addRootDriveConfig adds the qemu config required for adding the root drive.
@@ -5434,9 +5467,36 @@ func (d *qemu) addPCIDevConfig(busName string, busAllocate busAllocator, pciConf
 	return monHook, nil
 }
 
+// Each coherent-memory GPU gets eight bare NUMA nodes (NVIDIA Grace platform requirement), its own
+// pxb-pcie bus number (starting at 128 as in NVIDIA's examples, well above the default root port pool)
+// and a pcie.0 slot counting down from the last one, as the default root ports count up from slot 1.
+const (
+	coherentGPUMaxCount       = 8
+	coherentGPUNUMANodeStride = 8
+	coherentGPUBusNrBase      = 128
+	coherentGPUBusNrStride    = 8
+	coherentGPUPCIeSlotTop    = 0x1f
+)
+
+// coherentGPUAllocator tracks the resources already used by the coherent-memory GPUs of a VM.
+type coherentGPUAllocator struct {
+	nextNode int // Next free NUMA node ID.
+	count    int // Number of GPUs allocated so far.
+}
+
+// validateBus checks that ordinary PCIe ports do not consume the coherent GPU bridges' addresses.
+func (a *coherentGPUAllocator) validateBus(bus *qemuBus) error {
+	if a.count > 0 && (bus.portNum >= coherentGPUBusNrBase || bus.devNum > coherentGPUPCIeSlotTop-a.count+1) {
+		return errors.New("PCIe root ports overlap coherent-memory GPU bridges; reduce limits.max_bus_ports or the number of devices")
+	}
+
+	return nil
+}
+
 // addGPUDevConfig adds the qemu config required for adding a GPU device.
-func (d *qemu) addGPUDevConfig(cfg *[]cfgSection, busName string, busAllocate busAllocator, gpuConfig []deviceConfig.RunConfigItem) error {
+func (d *qemu) addGPUDevConfig(cfg *[]cfgSection, busName string, busAllocate busAllocator, gpuConfig []deviceConfig.RunConfigItem, coherentAlloc *coherentGPUAllocator) error {
 	var devName, pciSlotName, vgpu string
+	coherentMemory := false
 	for _, gpuItem := range gpuConfig {
 		switch gpuItem.Key {
 		case "devName":
@@ -5445,6 +5505,8 @@ func (d *qemu) addGPUDevConfig(cfg *[]cfgSection, busName string, busAllocate bu
 			pciSlotName = gpuItem.Value
 		case "vgpu":
 			vgpu = gpuItem.Value
+		case "coherentMemory":
+			coherentMemory = gpuItem.Value == "true"
 		}
 	}
 
@@ -5474,22 +5536,86 @@ func (d *qemu) addGPUDevConfig(cfg *[]cfgSection, busName string, busAllocate bu
 		return true
 	}()
 
-	_, devBus, devAddr, multi, err := busAllocate(devName, true)
-	if err != nil {
-		return fmt.Errorf("Failed allocating bus for GPU device %q: %w", devName, err)
-	}
-
 	gpuDevPhysicalOpts := qemuGPUDevPhysicalOpts{
-		dev: qemuDevOpts{
-			busName:       busName,
-			devBus:        devBus,
-			devAddr:       devAddr,
-			multifunction: multi,
-		},
 		devName:     devName,
 		pciSlotName: pciSlotName,
 		vga:         vgaMode,
 		vgpu:        vgpu,
+	}
+
+	if coherentMemory {
+		if d.architecture != osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN || busName != "pcie" {
+			return errors.New("Coherent-memory GPUs require an ARM64 VM with PCIe")
+		}
+
+		if coherentAlloc == nil {
+			return errors.New("Missing coherent-memory GPU allocator")
+		}
+
+		if coherentAlloc.count >= coherentGPUMaxCount {
+			return fmt.Errorf("Coherent-memory GPU limit exceeded: maximum is %d", coherentGPUMaxCount)
+		}
+
+		// Coherent-memory GPUs get a dedicated pxb-pcie/arm-smmuv3 bridge and root port, plus bare
+		// NUMA nodes (with ACPI generic initiators) representing the GPU's coherent memory.
+		firstNode := coherentAlloc.nextNode
+		coherentAlloc.nextNode += coherentGPUNUMANodeStride
+		index := coherentAlloc.count
+		coherentAlloc.count++
+		busNr := coherentGPUBusNrBase + index*coherentGPUBusNrStride
+
+		gpuDevID := qemuDeviceNameOrID(qemuDeviceIDPrefix, devName, "", qemuDeviceIDMaxLength)
+		bridgeName := qemuDeviceNameOrID("lxd_pxb_", devName, "", qemuDeviceIDMaxLength)
+		smmuName := qemuDeviceNameOrID("lxd_smmu_", devName, "", qemuDeviceIDMaxLength)
+		rootPortName := qemuDeviceNameOrID("lxd_rp_", devName, "", qemuDeviceIDMaxLength)
+		const iommufdID = "iommufd0"
+
+		// The iommufd object is shared by all coherent GPUs, so only emit it once.
+		if index == 0 {
+			*cfg = append(*cfg, qemuIOMMUFD(&qemuIOMMUFDOpts{id: iommufdID})...)
+		}
+
+		*cfg = append(*cfg, qemuPCIExpanderBridge(&qemuPCIExpanderBridgeOpts{
+			bridgeName:      bridgeName,
+			busNr:           busNr,
+			devAddr:         fmt.Sprintf("%x.0", coherentGPUPCIeSlotTop-index),
+			numaNode:        0,
+			smmuName:        smmuName,
+			rootPortName:    rootPortName,
+			rootPortChassis: busNr,
+		})...)
+
+		// The GPU is the sole device behind its dedicated root port.
+		gpuDevPhysicalOpts.dev = qemuDevOpts{
+			busName:       busName,
+			devBus:        rootPortName,
+			devAddr:       "00.0",
+			multifunction: false,
+		}
+
+		gpuDevPhysicalOpts.iommufd = iommufdID
+
+		for i := range coherentGPUNUMANodeStride {
+			nodeID := firstNode + i
+			*cfg = append(*cfg, qemuCoherentNumaNode(nodeID)...)
+			*cfg = append(*cfg, qemuACPIGenericInitiator(&qemuACPIGenericInitiatorOpts{
+				objID:    qemuDeviceNameOrID("lxd_gi_", fmt.Sprintf("%s_%d", devName, i), "", qemuDeviceIDMaxLength),
+				pciDevID: gpuDevID,
+				nodeID:   nodeID,
+			})...)
+		}
+	} else {
+		_, devBus, devAddr, multi, err := busAllocate(devName, true)
+		if err != nil {
+			return fmt.Errorf("Failed allocating bus for GPU device %q: %w", devName, err)
+		}
+
+		gpuDevPhysicalOpts.dev = qemuDevOpts{
+			busName:       busName,
+			devBus:        devBus,
+			devAddr:       devAddr,
+			multifunction: multi,
+		}
 	}
 
 	// Add main GPU device in VGA mode to qemu config.
@@ -5508,7 +5634,7 @@ func (d *qemu) addGPUDevConfig(cfg *[]cfgSection, busName string, busAllocate bu
 	prefix, _, _ := strings.Cut(pciSlotName, ".")
 
 	// Iterate the members of the IOMMU group and override any that match the parent slot name prefix.
-	err = filepath.Walk(iommuGroupPath, func(path string, _ os.FileInfo, err error) error {
+	err := filepath.Walk(iommuGroupPath, func(path string, _ os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}

@@ -134,7 +134,8 @@ func qemuDefaultRAMObject(architecture int) string {
 }
 
 type qemuBaseOpts struct {
-	architecture int
+	architecture     int
+	coherentGPUCount int // Number of NVIDIA coherent-memory GPUs attached to the VM.
 }
 
 func qemuBase(opts *qemuBaseOpts) []cfgSection {
@@ -163,11 +164,18 @@ func qemuBase(opts *qemuBaseOpts) []cfgSection {
 		{key: "usb", value: "off"},
 	}
 
+	// Coherent GPUs need their memory mapped into the guest's high MMIO window (can be overridden through raw.qemu.conf).
+	if opts.architecture == osarch.ARCH_64BIT_ARMV8_LITTLE_ENDIAN && opts.coherentGPUCount > 0 {
+		entries = append(entries, cfgEntry{key: "highmem-mmio-size", value: qemuHighmemMMIOSize(opts.coherentGPUCount)})
+	}
+
 	// On non-x86_64 architectures with a known default RAM object, the guest's main RAM
 	// is defined as an explicit shared memory backend (see qemuCPU) so that vhost-user
 	// devices such as virtiofsd can map it.
 	// The backend is attached to the machine through the "memory-backend" property.
-	if opts.architecture != osarch.ARCH_64BIT_INTEL_X86 {
+	// Coherent GPUs need NUMA node 0 to own the guest RAM through "-numa memdev" (see qemuCPU),
+	// which QEMU does not allow in combination with the machine's "memory-backend".
+	if opts.architecture != osarch.ARCH_64BIT_INTEL_X86 && opts.coherentGPUCount == 0 {
 		memoryBackend := qemuDefaultRAMObject(opts.architecture)
 		if memoryBackend != "" {
 			entries = append(entries, cfgEntry{key: "memory-backend", value: memoryBackend})
@@ -525,6 +533,7 @@ type qemuCPUOpts struct {
 	cpuNumaNodes        []uint64
 	cpuNumaMapping      []qemuNumaEntry
 	cpuNumaHostNodes    []uint64
+	coherentGPUs        bool // Guest RAM is described by explicit NUMA nodes (as on x86_64) rather than the machine memory backend.
 	hugepages           string
 	memory              int64
 	qemuMemObjectFormat string
@@ -584,7 +593,7 @@ func qemuCPU(opts *qemuCPUOpts, pinning bool) []cfgSection {
 		entries: entries,
 	}}
 
-	if opts.architecture != osarch.ARCH_64BIT_INTEL_X86 {
+	if opts.architecture != osarch.ARCH_64BIT_INTEL_X86 && !opts.coherentGPUs {
 		ramObjectName := qemuDefaultRAMObject(opts.architecture)
 		if ramObjectName == "" {
 			// Architecture without a known default RAM object; leave the guest
@@ -625,6 +634,14 @@ func qemuCPU(opts *qemuCPUOpts, pinning bool) []cfgSection {
 		numaHostNode := qemuCPUNumaHostNode(opts, 0)
 		// unconditionally append "share = "on" to the [object "mem0"] section
 		numaHostNode[0].entries = append(numaHostNode[0].entries, share)
+
+		// With coherent GPUs the extra bare NUMA nodes belong to the GPU, so every (including hotplugged)
+		// vCPU must be pinned to node 0 rather than spread across them by QEMU's default distribution.
+		if opts.coherentGPUs {
+			maxCPUs := max(opts.cpuMaxCPUs, opts.cpuCount)
+			numaHostNode[1].entries = append(numaHostNode[1].entries, cfgEntry{key: "cpus", value: fmt.Sprintf("0-%d", maxCPUs-1)})
+		}
+
 		return append(sections, numaHostNode...)
 	}
 
@@ -633,8 +650,8 @@ func qemuCPU(opts *qemuCPUOpts, pinning bool) []cfgSection {
 
 		extraMemEntries := []cfgEntry{{key: "policy", value: "bind"}}
 
-		if opts.hugepages != "" {
-			// append share = "on" only if hugepages is set
+		if opts.hugepages != "" || opts.coherentGPUs {
+			// Coherent GPU RAM must remain shared for vhost-user devices such as virtiofsd.
 			extraMemEntries = append(extraMemEntries, share)
 		}
 
@@ -881,18 +898,38 @@ func qemuPCIPhysical(opts *qemuPCIPhysicalOpts) []cfgSection {
 	}}
 }
 
+// qemuHighmemMMIOSize returns the "highmem-mmio-size" needed for coherentGPUCount GPUs. Per NVIDIA's
+// Grace I/O Virtualization Guide 4T covers up to 4 GPUs and 8T up to 8 (must be a power of two).
+func qemuHighmemMMIOSize(coherentGPUCount int) string {
+	if coherentGPUCount <= 0 {
+		return ""
+	}
+
+	if coherentGPUCount <= 4 {
+		return "4T"
+	}
+
+	return "8T"
+}
+
 type qemuGPUDevPhysicalOpts struct {
 	dev         qemuDevOpts
 	devName     string
 	pciSlotName string
 	vgpu        string
 	vga         bool
+	iommufd     string // When set, use the iommufd-backed "vfio-pci-nohotplug" device with this object ID.
 }
 
 func qemuGPUDevPhysical(opts *qemuGPUDevPhysicalOpts) []cfgSection {
+	pciName := "vfio-pci"
+	if opts.iommufd != "" {
+		pciName = "vfio-pci-nohotplug"
+	}
+
 	deviceOpts := qemuDevEntriesOpts{
 		dev:     opts.dev,
-		pciName: "vfio-pci",
+		pciName: pciName,
 		ccwName: "vfio-ccw",
 	}
 
@@ -909,11 +946,106 @@ func qemuGPUDevPhysical(opts *qemuGPUDevPhysicalOpts) []cfgSection {
 		entries = append(entries, cfgEntry{key: "x-vga", value: "on"})
 	}
 
+	if opts.iommufd != "" {
+		entries = append(entries, cfgEntry{key: "iommufd", value: opts.iommufd}, cfgEntry{key: "rombar", value: "0"})
+	}
+
 	return []cfgSection{{
 		// Devices use "lxd_" prefix indicating that this is a user named device.
 		name:    `device "` + qemuDeviceNameOrID(qemuDeviceIDPrefix, opts.devName, "", qemuDeviceIDMaxLength) + `"`,
 		comment: `GPU card ("` + opts.devName + `" device)`,
 		entries: entries,
+	}}
+}
+
+// qemuIOMMUFDOpts configures the iommufd object shared by all coherent-memory GPUs of a VM.
+type qemuIOMMUFDOpts struct {
+	id string
+}
+
+// qemuIOMMUFD emits an iommufd object. It must only be emitted once per VM.
+func qemuIOMMUFD(opts *qemuIOMMUFDOpts) []cfgSection {
+	return []cfgSection{{
+		name: `object "` + opts.id + `"`,
+		entries: []cfgEntry{
+			{key: "qom-type", value: "iommufd"},
+		},
+	}}
+}
+
+// qemuPCIExpanderBridgeOpts configures a pxb-pcie bridge with its own SMMUv3 and root port for one coherent-memory GPU.
+type qemuPCIExpanderBridgeOpts struct {
+	bridgeName      string // QEMU device id for the pxb-pcie bridge.
+	busNr           int    // Unique (per VM) PCI bus number for the bridge.
+	devAddr         string // Fixed slot on pcie.0, kept clear of the ascending slots used by the default root ports.
+	numaNode        int    // CPU-affinity NUMA node the bridge belongs to.
+	smmuName        string // QEMU device id for the arm-smmuv3 vIOMMU.
+	rootPortName    string // QEMU device id for the root port under the bridge.
+	rootPortChassis int    // Unique (per VM) chassis number for the root port.
+}
+
+// qemuPCIExpanderBridge emits the pxb-pcie bridge, its arm-smmuv3 and the root port for the GPU.
+// Follows NVIDIA's reference flags, except "pasid=on" which is broken on the targeted QEMU versions.
+func qemuPCIExpanderBridge(opts *qemuPCIExpanderBridgeOpts) []cfgSection {
+	return []cfgSection{{
+		name: `device "` + opts.bridgeName + `"`,
+		entries: []cfgEntry{
+			{key: "driver", value: "pxb-pcie"},
+			{key: "bus", value: "pcie.0"},
+			{key: "bus_nr", value: strconv.Itoa(opts.busNr)},
+			{key: "addr", value: opts.devAddr},
+			{key: "numa_node", value: strconv.Itoa(opts.numaNode)},
+		},
+	}, {
+		name: `device "` + opts.smmuName + `"`,
+		entries: []cfgEntry{
+			{key: "driver", value: "arm-smmuv3"},
+			{key: "primary-bus", value: opts.bridgeName},
+			{key: "accel", value: "on"},
+			{key: "ats", value: "on"},
+			{key: "ril", value: "off"},
+			{key: "oas", value: "48"},
+		},
+	}, {
+		name: `device "` + opts.rootPortName + `"`,
+		entries: []cfgEntry{
+			{key: "driver", value: "pcie-root-port"},
+			{key: "bus", value: opts.bridgeName},
+			{key: "chassis", value: strconv.Itoa(opts.rootPortChassis)},
+			{key: "io-reserve", value: "0"},
+			{key: "addr", value: "00.0"},
+		},
+	}}
+}
+
+// qemuCoherentNumaNode emits a bare NUMA node (no memory or CPUs) for a coherent-memory GPU.
+func qemuCoherentNumaNode(nodeID int) []cfgSection {
+	return []cfgSection{{
+		name: "numa",
+		entries: []cfgEntry{
+			{key: "type", value: "node"},
+			{key: "nodeid", value: strconv.Itoa(nodeID)},
+		},
+	}}
+}
+
+// qemuACPIGenericInitiatorOpts configures an acpi-generic-initiator object tying a
+// bare NUMA node to the PCI device whose memory it represents.
+type qemuACPIGenericInitiatorOpts struct {
+	objID    string // QEMU object id, must be unique per VM.
+	pciDevID string // QEMU device id of the GPU this node is associated with.
+	nodeID   int
+}
+
+// qemuACPIGenericInitiator emits an acpi-generic-initiator object associating a bare NUMA node with a PCI device.
+func qemuACPIGenericInitiator(opts *qemuACPIGenericInitiatorOpts) []cfgSection {
+	return []cfgSection{{
+		name: `object "` + opts.objID + `"`,
+		entries: []cfgEntry{
+			{key: "qom-type", value: "acpi-generic-initiator"},
+			{key: "pci-dev", value: opts.pciDevID},
+			{key: "node", value: strconv.Itoa(opts.nodeID)},
+		},
 	}}
 }
 

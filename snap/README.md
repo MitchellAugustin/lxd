@@ -12,6 +12,19 @@ Local builds require the LXD snap to be installed as `snapcraft` creates a conta
 snapcraft pack
 ```
 
+When installing a locally built snap, explicitly connect the privileged
+`lxd-support` interface and restart LXD:
+
+```sh
+sudo snap install --dangerous lxd_*.snap
+sudo snap connect lxd:lxd-support
+sudo snap restart lxd
+```
+
+Without this connection, snap confinement can block daemon operations, including
+image extraction. Installing with `--devmode` does not bypass explicit seccomp
+denials.
+
 ## Build the LXD snap on Launchpad
 
 To build the snap for multiple architectures, Launchpad builders can be used.

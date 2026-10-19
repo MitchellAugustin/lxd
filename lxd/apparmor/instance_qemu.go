@@ -23,6 +23,7 @@ profile "{{ .name }}" flags=(attach_disconnected,mediate_deleted) {
 
   # Needed by qemu
   /dev/hugepages/**                         rw,
+  /dev/iommu                                rw,
   /dev/kvm                                  rw,
   /dev/net/tun                              rw,
   /dev/ptmx                                 rw,
