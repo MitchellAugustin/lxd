@@ -12,7 +12,7 @@ func isNvidiaCoherentGPU(vendorID string, productID string) bool {
 
 	// Only Grace superchip IDs qualify; discrete GPUs using the same die do not.
 	switch strings.ToLower(productID) {
-	case "2342", "2348", "2941": // GH200 120GB/480GB, GH200 144GB HBM3e, GB200.
+	case "2342", "2348", "2941", "3041": // GH200 120GB/480GB, GH200 144GB HBM3e, GB200, Vera Rubin.
 		return true
 	default:
 		return false
