@@ -298,14 +298,14 @@ func (d *gpuPhysical) startVM() (*deviceConfig.RunConfig, error) {
 		}
 
 		pciAddress = gpu.PCIAddress
-		coherentMemory = isGraceCoherentGPU(gpu.VendorID, gpu.ProductID)
+		coherentMemory = isNvidiaCoherentGPU(gpu.VendorID, gpu.ProductID)
 	}
 
 	if pciAddress == "" {
 		return nil, errors.New("Failed detecting requested GPU device")
 	}
 
-	// Grace GPUs need the variant driver to expose their coherent memory as System RAM.
+	// NVIDIA coherent GPUs need the variant driver to expose their coherent memory as System RAM.
 	vfioDriver := "vfio-pci"
 	if coherentMemory {
 		vfioDriver = "nvgrace_gpu_vfio_pci"

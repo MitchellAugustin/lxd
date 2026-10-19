@@ -4,8 +4,8 @@ import (
 	"strings"
 )
 
-// isGraceCoherentGPU returns true if the PCI vendor/product ID pair is a known Grace coherent-memory GPU.
-func isGraceCoherentGPU(vendorID string, productID string) bool {
+// isNvidiaCoherentGPU returns true if the PCI vendor/product ID pair is a known NVIDIA coherent-memory GPU.
+func isNvidiaCoherentGPU(vendorID string, productID string) bool {
 	if !strings.EqualFold(vendorID, "10de") {
 		return false
 	}

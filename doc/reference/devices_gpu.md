@@ -83,10 +83,10 @@ Or pass all AMD GPUs from the host:
 
 For a complete example on how to use a GPU CDI pass-through, see {ref}`container-gpu-passthrough-with-docker`.
 
-(gpu-physical-grace-coherent)=
-#### NVIDIA Grace coherent-memory GPUs (VMs only)
+(gpu-physical-nvidia-coherent)=
+#### NVIDIA coherent-memory GPUs (VMs only)
 
-The `physical` GPU device automatically detects NVIDIA Grace coherent-memory GPUs
+The `physical` GPU device automatically detects NVIDIA coherent-memory GPUs
 (GH200/GB200 family) in ARM64 VMs. On the host, LXD binds them to
 `nvgrace_gpu_vfio_pci` instead of `vfio-pci`. In the VM, it generates a dedicated
 `iommufd`-backed VFIO device, a `pxb-pcie`/`arm-smmuv3` PCI expander bridge, eight

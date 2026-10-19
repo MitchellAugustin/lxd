@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-func TestIsGraceCoherentGPU(t *testing.T) {
+func TestIsNvidiaCoherentGPU(t *testing.T) {
 	tests := []struct {
 		name      string
 		vendorID  string
@@ -25,9 +25,9 @@ func TestIsGraceCoherentGPU(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := isGraceCoherentGPU(tt.vendorID, tt.productID)
+			got := isNvidiaCoherentGPU(tt.vendorID, tt.productID)
 			if got != tt.want {
-				t.Errorf("isGraceCoherentGPU(%q, %q) = %v, want %v", tt.vendorID, tt.productID, got, tt.want)
+				t.Errorf("isNvidiaCoherentGPU(%q, %q) = %v, want %v", tt.vendorID, tt.productID, got, tt.want)
 			}
 		})
 	}

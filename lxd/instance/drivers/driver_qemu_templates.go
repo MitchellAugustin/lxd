@@ -135,7 +135,7 @@ func qemuDefaultRAMObject(architecture int) string {
 
 type qemuBaseOpts struct {
 	architecture     int
-	coherentGPUCount int // Number of Grace coherent-memory GPUs attached to the VM.
+	coherentGPUCount int // Number of NVIDIA coherent-memory GPUs attached to the VM.
 }
 
 func qemuBase(opts *qemuBaseOpts) []cfgSection {
